@@ -752,6 +752,8 @@ class OptimizationAbstractMGAMixin:
         self,
         direction: dict | pd.Series,
         dimensions: dict,
+        cache_dir: str | None = None,
+        mga_extra_functionality: Any = None,
         snapshots: Sequence | None = None,
         multi_investment_periods: bool = False,
         slack: float = 0.05,
@@ -771,6 +773,15 @@ class OptimizationAbstractMGAMixin:
             the dimensions (matching those in the `direction`
             argument), and the values are dictionaries with the same
             structure as the `weights` argument in `optimize_mga`.
+        cache_dir : str | None, optional
+            Directory to store cached results. If None, caching is disabled.
+            Defaults to None.
+        mga_extra_functionality : callable | None, optional
+            Optional callback function called after successful optimization.
+            Signature: mga_extra_functionality(n, snapshots, cache_dir, network_hash, direction_hash, check_only=False).
+            When check_only=True, should return bool indicating if outputs exist.
+            When check_only=False, should create outputs using the solved network.
+            Defaults to None.
         snapshots : Sequence | None, optional
             Set of snapshots to consider in the optimization. If None, uses all
             snapshots from the network. Defaults to None.
@@ -820,6 +831,60 @@ class OptimizationAbstractMGAMixin:
         if snapshots is None:
             snapshots = self._n.snapshots
 
+        # Check cache before solving
+        if cache_dir is not None:
+            # Compute hashes for cache lookup
+            network_hash = hash_mga(
+                self._n,
+                dimensions,
+                slack,
+                snapshots=snapshots,
+                multi_investment_periods=multi_investment_periods,
+            )
+            direction_hash = hash_direction(direction)
+
+            # Check coordinate cache
+            cached_result = get_cached_direction(cache_dir, network_hash, direction_hash)
+
+            if cached_result is not None:
+                _, cached_coordinates = cached_result
+
+                # If extra_functionality provided, check if its outputs also exist
+                if mga_extra_functionality is not None:
+                    try:
+                        outputs_exist = mga_extra_functionality(
+                            None,  # No network needed for check
+                            snapshots,
+                            cache_dir,
+                            network_hash,
+                            direction_hash,
+                            check_only=True,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to check extra_functionality outputs: %s", e
+                        )
+                        outputs_exist = False
+
+                    if outputs_exist:
+                        logger.info(
+                            "Cache HIT: coordinates and extra outputs exist for direction %s",
+                            direction_hash[:8],
+                        )
+                        return "ok", "optimal", cached_coordinates
+                    else:
+                        logger.debug(
+                            "Cache partial: coordinates exist but extra outputs missing for direction %s",
+                            direction_hash[:8],
+                        )
+                else:
+                    # No extra_functionality, use cached coordinates
+                    logger.info(
+                        "Cache HIT: coordinates exist for direction %s",
+                        direction_hash[:8],
+                    )
+                    return "ok", "optimal", cached_coordinates
+
         # check that network has been solved
         if not self._n.is_solved:
             msg = "Network needs to be solved with `n.optimize()` before running MGA."
@@ -846,6 +911,26 @@ class OptimizationAbstractMGAMixin:
         status, condition = self._n.optimize.solve_model(**kwargs)
         coordinates = self.project_solved(dimensions) if status == "ok" else None
 
+        # Call extra_functionality after successful solve
+        if status == "ok" and mga_extra_functionality is not None and cache_dir is not None:
+            try:
+                mga_extra_functionality(
+                    self._n,
+                    snapshots,
+                    cache_dir,
+                    network_hash,
+                    direction_hash,
+                    check_only=False,
+                )
+            except Exception as e:
+                logger.warning("Failed to run mga_extra_functionality: %s", e)
+
+        # Save to cache after successful solve
+        if status == "ok" and cache_dir is not None:
+            save_cached_direction(
+                cache_dir, network_hash, direction_hash, direction, coordinates
+            )
+
         # write MGA coefficients into metadata
         self._n.meta["slack"] = slack
         self._n.meta["dimensions"] = _convert_to_dict(dimensions)
@@ -858,8 +943,8 @@ class OptimizationAbstractMGAMixin:
         fn: str,
         direction: dict,
         dimensions: dict,
-        cache_key: str | None = None,  # Network hash for cache file (optional)
-        cache_dir: str | None = None,  # Cache directory (optional)
+        cache_dir: str | None = None,
+        mga_extra_functionality: Any = None,
         snapshots: Sequence | None = None,
         multi_investment_periods: bool = False,
         slack: float = 0.05,
@@ -868,45 +953,15 @@ class OptimizationAbstractMGAMixin:
     ) -> tuple[dict, pd.Series | None]:
         """Solve a single direction for parallel execution (helper method).
 
-        Checks cache before solving and saves results after solving.
-        Uses a two-level caching approach:
-        1. Network hash (network config) determines the cache file
-        2. Direction hash (specific direction) determines the entry within that file
+        Caching is handled within optimize_mga_in_direction.
 
         """
         from pypsa.networks import Network  # noqa: PLC0415
 
-        # Load network to compute hashes
+        # Load network from file
         n = Network(fn)
 
-        # Check cache BEFORE solving
-        if cache_dir is not None and cache_key is not None:
-            # cache_key is the network hash (from hash_mga, without directions)
-            network_hash = cache_key
-
-            # Compute direction-specific hash
-            direction_hash = hash_direction(direction)
-
-            # Look up in cache database
-            cached_result = get_cached_direction(
-                cache_dir, network_hash, direction_hash
-            )
-            if cached_result is not None:
-                cached_direction, cached_coordinates = cached_result
-                logger.info(
-                    "Cache HIT: direction %s from network cache %s",
-                    direction_hash[:8],
-                    network_hash[:8],
-                )
-                return (direction, cached_coordinates)
-            else:
-                logger.debug(
-                    "Cache MISS: direction %s not in network cache %s",
-                    direction_hash[:8],
-                    network_hash[:8],
-                )
-
-        # Not in cache, solve it
+        # Solve (caching handled inside optimize_mga_in_direction)
         try:
             # Handle None values
             if kwargs is None:
@@ -917,6 +972,8 @@ class OptimizationAbstractMGAMixin:
             _, _, coordinates = n.optimize.optimize_mga_in_direction(
                 direction=direction,
                 dimensions=dimensions,
+                cache_dir=cache_dir,
+                mga_extra_functionality=mga_extra_functionality,
                 snapshots=snapshots,
                 multi_investment_periods=multi_investment_periods,
                 slack=slack,
@@ -936,13 +993,6 @@ class OptimizationAbstractMGAMixin:
             )
             return (direction, None)
         else:
-            # Save to cache
-            if cache_dir is not None and cache_key is not None:
-                network_hash = cache_key
-                direction_hash = hash_direction(direction)
-                save_cached_direction(
-                    cache_dir, network_hash, direction_hash, direction, coordinates
-                )
             return (direction, coordinates)
 
     def optimize_mga_in_multiple_directions(
@@ -950,6 +1000,7 @@ class OptimizationAbstractMGAMixin:
         directions: list[dict] | pd.DataFrame,
         dimensions: dict,
         cache_dir: str | None = None,
+        mga_extra_functionality: Any = None,
         snapshots: Sequence | None = None,
         multi_investment_periods: bool = False,
         slack: float = 0.05,
@@ -984,6 +1035,12 @@ class OptimizationAbstractMGAMixin:
             structure as the `weights` argument in `optimize_mga`.
         cache_dir : str | None, optional
             Directory to store cached results. If None, caching is disabled.
+        mga_extra_functionality : callable | None, optional
+            Optional callback function called after successful optimization.
+            Signature: mga_extra_functionality(n, snapshots, cache_dir, network_hash, direction_hash, check_only=False).
+            When check_only=True, should return bool indicating if outputs exist.
+            When check_only=False, should create outputs using the solved network.
+            Defaults to None.
         snapshots : Sequence | None, optional
             Set of snapshots to consider in the optimization. If None, uses all
             snapshots from the network. Defaults to None.
@@ -1060,20 +1117,10 @@ class OptimizationAbstractMGAMixin:
         if cache_dir is not None:
             # Ensure cache dir exists
             Path(cache_dir).mkdir(parents=True, exist_ok=True)
-
-            # Compute network hash for cache file
-            network_hash = hash_mga(
-                self._n,
-                dimensions,
-                slack,
-                snapshots=snapshots,
-                multi_investment_periods=multi_investment_periods,
-            )
-
-            logger.info("Using network cache: %s", network_hash[:8])
+            logger.info("Caching enabled")
         else:
             logger.info("Caching disabled")
-            network_hash = None
+
         # Handle default parameters from options
         if model_kwargs is None:
             model_kwargs = options.params.optimize.model_kwargs.copy()
@@ -1104,8 +1151,8 @@ class OptimizationAbstractMGAMixin:
                                     fn,
                                     direction,
                                     dimensions,
-                                    network_hash,
                                     cache_dir,
+                                    mga_extra_functionality,
                                     snapshots,
                                     multi_investment_periods,
                                     slack,
